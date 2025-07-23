@@ -1,0 +1,238 @@
+---
+title: "Proliferation"
+output: html_document
+date: "2025-04-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(scITD)
+library(Seurat)
+library(zellkonverter)
+library(dplyr)
+library(biomaRt)
+library(dplyr)
+library(purrr)
+library(pheatmap)
+library(tidyr)
+library(RColorBrewer)
+```
+
+```{r}
+library(clusterProfiler)
+library(AnnotationDbi)
+library(enrichplot)
+library(anndata)
+library(ggplot2)
+```
+
+
+```{r}
+ad <- anndata::read_h5ad("230111_Bleo_Ageing_annotated_final.h5ad")
+
+gene_names <- ad$var_names  # Assuming 'var_names' holds the gene names
+
+# Select the Ensembl BioMart dataset for mouse genes
+ensembl <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+# Get the mapping between MGI symbols and HGNC symbols (or Ensembl gene IDs)
+conversion_table <- getBM(attributes = c('mgi_symbol', 'external_gene_name'),
+                          mart = ensembl)
+
+# Create a named vector for easy lookup
+mgi_to_standard <- setNames(conversion_table$external_gene_name, conversion_table$mgi_symbol)
+
+converted_gene_names <- gene_names %>% map_chr(~ mgi_to_standard[.x] %||% .x)
+
+ad$var_names <- converted_gene_names
+
+## remove duplicates
+non_dup_indices <- !duplicated(ad$var_names)
+
+ad <- ad[, non_dup_indices]
+
+ad$var_names <- toupper(ad$var_names)
+```
+
+```{r}
+# Define custom colors for each Age_day category
+age_day_colors <- c(
+  "young_d0" = "#a6bddb",  # Blue
+  "young_d3" = "#67a9cf",  # Light Blue
+  "young_d10" = "#3690c0", # Orange
+  "young_d20" = "#02818a", # Light Orange
+  "young_d30" = "#016c59", # Green
+  "young_d37" = "#014636", # Light Green
+  "old_d0" = "#fcc5c0",    # Red
+  "old_d3" = "#fa9fb5",    # Light Red
+  "old_d10" = "#f768a1",   # Purple
+  "old_d20" = "#dd3497",   # Light Purple
+  "old_d30" = "#ae017e",   # Brown
+  "old_d37" = "#7a0177"    # Light Brown
+)
+
+# Assign colors in annotation_colors list
+annotation_colors <- list(age_day = age_day_colors)
+
+ordered_age_days <- c("young_d0", "young_d3", "young_d10", "young_d20", "young_d30", "young_d37", "old_d0", "old_d3",  "old_d10", "old_d20", "old_d30", "old_d37")
+
+# --- Step 7. Plot the continuous heatmap ---
+color_palette <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(100)
+```
+
+```{r}
+f1_significant_genes <- read.csv("significant_genes_factor1.csv")
+f2_significant_genes <- read.csv("significant_genes_factor2.csv")
+f3_significant_genes <- read.csv("significant_genes_factor3.csv")
+f4_significant_genes <- read.csv("significant_genes_factor4.csv")
+f5_significant_genes <- read.csv("significant_genes_factor5.csv")
+```
+
+## Cell type contribution analysis
+
+```{r}
+# Calculate total contribution for each cell type
+cell_type_contributions <- f5_significant_genes %>%
+  group_by(Cell_Type) %>%
+  summarise(total_contribution = sum(abs(Loading))) %>%
+  arrange(desc(total_contribution))
+
+# Check the results
+head(cell_type_contributions)
+```
+
+```{r}
+pdf("CellType_contrubtuion_factor5.pdf", width = 6, height = 4)
+
+ggplot(cell_type_contributions, aes(x = reorder(Cell_Type, total_contribution), y = total_contribution, fill = total_contribution)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  # Flip the coordinates for better readability
+  labs(x = "Cell Type", y = "Total Contribution", title = "Contribution of Cell Types to Factor 5") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +  # Gradient from light blue to dark blue
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    axis.text.x = element_text(angle = 0)  # Optional: Adjust x-axis text if needed
+  )
+
+dev.off()
+```
+
+## Proliferation analysis
+```{r}
+# 1. Extract metadata
+obs_df <- as.data.frame(ad$obs)
+```
+
+```{r}
+cell_types <- unique(obs_df$ct_level2)
+# View all cell types with their indices
+data.frame(Index = seq_along(cell_types), CellType = cell_types)
+```
+
+```{r}
+# Function to plot relative frequency of a given cell type
+plot_relative_freq <- function(adata, cell_type) {
+  # Extract relevant data
+  cell_data <- data.frame(
+    age_day = adata$obs$age_day,
+    cell_type = adata$obs$ct_level2
+  )
+
+  cell_counts <- cell_data %>%
+  filter(cell_type == selected_cell_type) %>%
+  group_by(age_day) %>%
+  summarise(count = n(), .groups = "drop")
+
+  # Count total number of cells in each age_day
+  total_counts <- cell_data %>%
+  group_by(age_day) %>%
+  summarise(total = n(), .groups = "drop")
+
+# Merge both dataframes and calculate relative frequency
+  cell_counts <- cell_counts %>%
+  left_join(total_counts, by = "age_day") %>%
+  mutate(relative_freq = (count / total) * 100)  # 
+  # Extract colors from AnnData (if available)
+  age_day_colors <- unlist(adata$uns$age_day_colors)
+
+  # Create bar plot
+  p <- ggplot(cell_counts, aes(x = age_day, y = relative_freq, fill = age_day)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(aes(label = sprintf("%.1f%%", relative_freq)),  # Add percentage labels
+              vjust = -0.5, size = 3, fontface = "bold") +
+    scale_fill_manual(values = age_day_colors) +  # Use original colors
+    theme_minimal(base_size = 14) +
+    labs(title = paste("Relative Frequency of", cell_type),
+         x = "Age and Day",
+         y = "Relative Frequency (%)",
+         fill = "Age Day") +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "none",
+      panel.grid = element_blank()  # Remove gridlines
+    )
+
+  # Show the plot
+  print(p)
+}
+
+
+```
+
+```{r}
+# Select by position (e.g., 5th cell type)
+selected_cell_type <- cell_types[52]
+plot_relative_freq(ad, selected_cell_type)
+```
+
+
+## Macrophage analysis
+```{r}
+macrophage_data <- ad[ad$obs$meta_label == "Macrophages", ]
+```
+
+```{r}
+# Genes of interest
+genes_of_interest <- c("ARG1", "SPP1", "MFGE8", "MMP12", "CCL2", "CCR2")
+```
+
+```{r}
+
+# Extract gene expression data for capitalized gene name
+gene_of_interest <- "CCR2"
+gene_expression_data <- macrophage_data$X[, gene_of_interest]
+
+# Convert to a data frame and add age_day information
+expression_df <- as.data.frame(gene_expression_data)
+expression_df$age_day <- macrophage_data$obs$age_day
+
+# Step 1: Group by age_day and compute the mean expression for each group
+aggregated_data <- expression_df %>%
+  group_by(age_day) %>%
+  summarise(mean_expression = mean(gene_expression_data, na.rm = TRUE))
+
+# Step 2: Normalize the mean expression (e.g., min-max normalization)
+aggregated_data$normalized_expression <- (aggregated_data$mean_expression - min(aggregated_data$mean_expression)) / 
+                                          (max(aggregated_data$mean_expression) - min(aggregated_data$mean_expression))
+```
+
+```{r}
+# Step 3: Make sure age_day is an ordered factor
+aggregated_data$age_day <- factor(aggregated_data$age_day, levels = sort(unique(aggregated_data$age_day)))
+
+# Step 4: Plot the normalized aggregated expression values with rotated labels and no grid lines
+ggplot(aggregated_data, aes(x = age_day, y = normalized_expression)) +
+  geom_point(size = 3, color = "blue") +   # Dots for each unique age_day
+  geom_line(size = 1, color = "blue", group = 1) +    # Line joining the dots, group = 1 ensures all points are connected
+  labs(x = "Age Day", y = "Normalized Expression", title = "Normalized Expression of CCR2 in Macrophages Across Age Days") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels
+    panel.grid = element_blank()  # Remove grid lines
+  )
+```
